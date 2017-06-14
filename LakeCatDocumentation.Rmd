@@ -1,0 +1,161 @@
+---
+title: "LakeCat Dataset Processing Workflow"
+author: "Marc Weber, Ryan Hill, Rick Debbout"
+date: "June 1, 2017"
+output: 
+  html_document:
+    theme: yeti
+    highlighted: default 
+    toc: yes
+    keep_md: true 
+---
+
+The LakeCat DataSet provides summaries of natural and anthropogenic landscape features for ~378,000 lakes and their associated catchments within the conterminous USA using the [NHDPlus Version 2](http://www.horizon-systems.com/NHDPlus/NHDPlusV2_data.php) (NHDPlusV2) as the geospatial framework. 
+
+Summaries are produced for NHDWaterbodies that hold an FTYPE of LakePond or Reservior in the attribute table. This document describes the process that occurs to deliver local, catchment level metrics and watershed level metrics for all records with these FTYPEs.
+
+![*NHDWaterbody Attribute Table example*](https://cloud.githubusercontent.com/assets/7052993/26746284/69764962-47a3-11e7-969b-5688ecc623a1.PNG)
+
+# __Determining On-Network and Off-Network Lakes__
+<a href="#top">*Back to top*</a>
+
+Once the NHDPlusV21 dataset's waterbody features are filtered by FTYPE, we first find the lakes that will be designated as on-network. These lakes are found to fit directly into the NHDPlusV21 framework, utilizing it's catchments to define watershed boundaries through the connectivity found in the PlusFlow tables. These waterbodies are linked through the tables delivered in the NHDPlusV21 and can draw directly from the landscape summaries produced in the [StreamCat dataset](ftp://newftp.epa.gov/EPADataCommons/ORD/NHDPlusLandscapeAttributes/StreamCat/WelcomePage.html). Ultimately, these waterbodies can utilize the NHD catchments to arrive at a watershed boundary to calculate summary statistics.
+
+After finding on-network lakes, the remaining lakes are considered to be off-network. These waterbodies require a hybridized framework to create geographic boundaries by which summary statistics can be produced.
+
+## On_Network Process
+
+### Step 1 -- Find lakes On_Network
+<a href="#top">*Back to top*</a>
+
+To begin, we determine which NHD waterbodies are on the NHD network based on joining the following tables within each NHDPlusV2 HydroRegion (see code in [*LakeCat_functions.py*](https://github.com/USEPA/LakeCat/blob/master/LakeCat_functions.py), NHDtblMerge function):
+
+![*NHD Table Joins to find on-network lakes*](https://cloud.githubusercontent.com/assets/7052993/19823341/f037171a-9d1c-11e6-84bb-5035685a7b2e.PNG)
+  
+NHDWaterbodies that are associated to NHDFlowlines through the 'WBAREACOMID' are selected through a table join. The NHDCatchments and NHDPlusFlowlineVAA tables can then joined using the flowline COMID. Using this table, we group records by the waterbody COMID in the [*NHDtblMerge*](https://github.com/USEPA/LakeCat/blob/master/LakeCat_functions.py) function. Within each group, we search for any FEATUREID value that is not null. If this is true, we select the FEATUREID whose Hydroseq value is the lowest within the group. This identifies the most downstream catchment associated with the waterbody, allowing for the accumulation of all upstream catchments to define the full watershed boundary. A dictionary holds each of the associated catchments as a value to a key that is the lowest Hydroseq catchment COMID for processing catchment level summaries for these lakes.
+
+Once all of these tables are joined, we can group them by the NHDwaterbody 'COMID'. In each group there can be more than one flowline associated to each waterbody.  Using the 'Hydroseq' attribute, we can find the catchment 'COMID' that is furthest downstream, and use this 'COMID to refer to StreamCat data and obtain summarized characteristics of each landscape layer. This connection is stored in a lookup table, CATCHMENT 'COMID' <--> WATERBODY 'COMID'. LakeCat final tables reflect WATERBODY 'COMID' in their 'COMID' field. 
+
+The remaining waterbodies are not on the stream network (as depicted with the NHDFlowline file) and are designated as *Off_Network* lakes and saved as *off-network.shp*. Watershed characteristics are developed for these lakes using the <a href="#off_network-process">*Off_Network Process*</a>.
+
+
+The [*NHDtblMerge*](https://github.com/USEPA/LakeCat/blob/master/LakeCat_functions.py) function (line 780) uses table joins to determine lakes that are in the NHDPlus version 2 network. The table below shows the keys that connect all of the NHDPlusV2 tables.
+
+
+### Step 2 -- Accumulate associated catchments for local area 'Cat' metrics
+<a href="#top">*Back to top*</a>
+
+StreamCat tables contain summarizations for individual stream catchments and for cumulative upstream watersheds.
+
+For an accurate local, catchment level summary, all of the associated catchments need to be used for the lake's catchment boundary.
+
+The [*LakeCat_functions.py*](https://github.com/USEPA/LakeCat/blob/master/LakeCat_functions.py) script creates arrays that hold the associated catchment COMIDs with the lakes most downstream catchment COMID. The same accumulation function is used to create summary statistics across all catchments associated with each waterbody, and updates catchment-level statistics to report summaries for all associated catchments to the given NHDWaterbody.
+
+![*Shows multiple flowlines and associated catchments to a given waterbody -- highlighted in yellow*](https://cloud.githubusercontent.com/assets/7052993/19825737/e17463a8-9d31-11e6-9a69-a4d1364b6aea.png)
+
+The image above shows the catchment area for the given lake. While many on-network lakes have only one associated catchment, many are associated with more than one. The catchment summarizations reflect all associated catchments found through the NHD table joins.
+
+### Step 3 -- Add-in lakes associated through NHDPlus Burn Components
+<a href="#top">*Back to top*</a>
+
+The Sink shapefile that is delivered in the NHDPlusBurnComponents folder of each hydroregion can be used to find additional NHDWaterbodies that fit within the network. These points are attached to waterbodies through a spatial join and added to the list of on-network lakes . The PURPDESC field of the point is identified as 'NHDWaterbody closed lake' and like other on-network lakes, it's waterbody COMID and catchment COMID are retained to link where the waterbody exists in the network. 
+
+
+
+## Off_Network Process
+
+After finding on-network waterbodies, the remaining are moved into the off-network process in order to create a framework that will operate in similar ways to that of the NHD catchments and flow tables. Because NHD catchments can't be used to define these lakes, we need to define them ourselves.
+
+### Step 1 -- Create local catchments for each off-network lake
+<a href="#top">*Back to top*</a>
+
+All off-network lakes were converted to ESRI shapefiles to rasters (.TIF format) using the NHDPlus flow accumulation raster as a snap raster. This conforms raster data to the grid laid out within the NHDPlus. These lake rasters are used as the pour point data in ESRI's [Watershed](http://desktop.arcgis.com/en/arcmap/10.3/tools/spatial-analyst-toolbox/watershed.htm) tool. The output of this tool provides watershed boundaries for each lake passed into it. These boundaries we are calling catchments for simplicity, however it is important to assert the difference as to how these boundaries are determined in comparison to the method used in the on-network process.
+
+
+NOT ALWAYS TRUE: *Each watershed is a portion of the NHDPlusV2 catchment which the lake falls within and define the local watershed basin for the lake.*
+
+![Off-Network](https://cloud.githubusercontent.com/assets/7052993/19703884/648f7f0e-9aba-11e6-90e0-e909b49f5de2.PNG)
+
+*Note that the off-network lake basin is only a portion of the catchment which it is in.*
+
+### Step 2 -- Find flow connections between basins
+<a href="#top">*Back to top*</a>
+
+Using adjacent local basins we can find flow connections between them with the ArcGIS shift tool and the RPU's flow direction raster. The script, LakeConnect.py, shifts the raster cells of each zones local watershed basins and tests if the value of that shifted cell is not the value that it holds, and second, then tests if the flow direction raster value demonstrates that there is flow in the same direction as the direction of the shift.  
+
+![shifted](https://cloud.githubusercontent.com/assets/7052993/19706148/306e4948-9ac5-11e6-9a80-c7e3362f7bc1.PNG)![directions](https://cloud.githubusercontent.com/assets/7052993/19816175/222618ce-9cfb-11e6-9290-9c737bb0adb2.PNG)
+
+This is done for each of the 8 directions that a raster cell can be moved, shown above. If both conditions are true the value of the basin IDs are saved in a flow table to be used to create full watersheds in the accumulation process.
+
+
+
+### Step 3 -- Perform zonal statistics and accumulate
+<a href="#top">*Back to top*</a>
+
+The *LakeCat.py* script creates tables for each landscape metric summarizing both for individual lake basins and for cumulative upstream watersheds. This process happens independently of the On-Network process and then tables from both processes are appended together.
+
+# __NHDWaterbody Designation QA Table__ 
+<a href="#top">*Back to top*</a>
+
+![This table describes waterbody handling through processing of the LakeCat framework across each Vector Processing Unit (VPU) of the NHDPlusV21](https://user-images.githubusercontent.com/7052993/27095512-c69f41ac-5022-11e7-918a-29ef1ca06eac.PNG)
+
+
+# __Catchments__  
+<a href="#top">*Back to top*</a>
+
+The term 'catchment' is used in the NHDPlusV21 to describe the portion of landscape that drains directly to an NHD stream segment. This is a modified definition of how the term has been traditionally defined, which is more so synonymous with the term 'watershed'. This naming convention used in the NHDPlusV21 for the shapefile that holds these geometries that are the spatial building-blocks of watershed boundaries. In the LakeCat dataset there is a distinction that needs to be made when using this term. The lake summaries that are delivered in LakeCat fall into two categories, on-network and off-network. In the case where lakes are determined to be on-network, the catchment geometries will be exactly the same as is found in the NHDPlusV21..
+
+![](C:\Users\Rdebbout\Downloads\LakesREADME\catchmentEXP\out.png)
+# __Point Landscape Layer PctFull Calculation__
+<a href="#top">*Back to top*</a>
+
+This is a description of how PctFull calculations are acheived in output tables for any landscape layer that is compsed of points (dams,mines,etc.).
+
+In categorical and continuous landscape layers we are able to determine if there are NoData cell values within each catchment through the return of the statistics functions ( ZonalStatisticsAsTable, TabulateArea). Each of these delivers a COUNT statistic, identifying how many cells w/in the zone hold data. This is compared with the total number of cells known to be in the zone based on the Catchment raster's attribute table to produce te percent full statistic (PctFull).
+
+To arrive at the percent full for landscape layers of type point, the following process takes place and is applied to all point layers in the script below. The borderline of the conterminous US (CONUS) is used from the TIGER line files for states. In the image below, the borderline intersects with the catchments. The clipped geometries areas are calculated and then compared with the area of the original catchment area to provide the proportion of the catchment that lies w/in the CONUS boundary.
+
+![Proportion of clipped geometry to original provides PctFull.](C:\Users\Rdebbout\Downloads\LakesREADME\border_img\border.png)
+
+__*Description of what is happening in [border.py](https://github.com/USEPA/LakeCat/blob/master/border.py)*__
+
+* States geometries are dissolved into one polygon
+* Spatial join is performed with catchments to isolate the basins that aren't completely w/in the CONUS boundary.
+* These catchments are clipped to the geometry that lies w/in the CONUS polygon.
+* The area of these new geometries are then calculated and compared w/ the full catchments geometry 
+
+# __This is another title__
+<a href="#top">*Back to top*</a>
+
+http://eecs.oregonstate.edu/colloquium/emergence-virtual-globe-and-their-role-spatial-data-infrastructures
+
+
+# __Omitted NHDPlusV21 waterbody COMIDs__
+<a href="#top">*Back to top*</a>
+
+COMID |	VPU |	REASON FOR OMISSION
+:------|:---:|--------------------:		
+14300071	|10U|	OVERLAPPED BY COMID 12568346
+12967474	|10U|	DOESN'T HIT CELL CENTER
+120052923	|10U|	OVERLAPPED BY COMID 120051949
+167245973	|10L|	OVERLAPPED BY COMID 120053749
+14819137	|07|	DOESN'T HIT CELL CENTER
+14820667	|07|	DOESN'T HIT CELL CENTER
+944040052	|14|	DOESN'T HIT CELL CENTER
+23854057	|17|	DOESN'T HIT CELL CENTER
+24052877	|17|	OVERLAPPED BY COMID 20315924
+120054048	|16|	OVERLAPPED BY COMID 120053946
+19861298	|16|	OVERLAPPED BY COMID 24989585
+162424445	|15|	OVERLAPPED BY COMID 120053954
+22323839	|09|	DOESN'T HIT CELL CENTER
+15235574	|08|	DOESN'T HIT CELL CENTER
+22700864	|08|	DOESN'T HIT CELL CENTER
+14725382	|04|	OVERLAPPED BY COMID 166766632
+20166532	|03N|	DOESN'T HIT CELL CENTER
+120054030	|18|	OVERLAPPED BY COMID 120053926
+
+
+
+### Lake outside of zone, but with different COMID
+zone 10U is where it exists as COMID: 120051949
+exists also in zone 17 as COMID:  120052923
